@@ -2,411 +2,330 @@ import logging
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import List, Dict, Any, Union, Optional, Tuple
-from pandas.tseries.offsets import BDay
+from typing import List, Dict, Any, Union, Tuple, Set
 
 logger = logging.getLogger(__name__)
 
 
-def apply_price_divergence_filter(
+def ensure_dir(path: Path) -> Path:
+    """Ensure directory exists, return path"""
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+# ============================================================
+# DIVERGENCE FILTER (STEP 8)
+# ============================================================
+
+
+def apply_divergence_filter(
     candidate_pairs: List[Tuple[str, str]],
     price_data: Dict[str, pd.DataFrame],
-    lookback_days: int = 5,
-    divergence_threshold: float = 0.10,
+    lookback_days: int,
+    divergence_threshold: float,
 ) -> List[Dict[str, Any]]:
     """
-    ✅ CORRECTED: Check if pairs have diverged > threshold over N days
+    Filter pairs based on recent PRICE divergence.
 
-    Parameters:
-    - lookback_days: N days for cumulative return calculation
-    - divergence_threshold: Minimum divergence percentage
-
-    IMPORTANT: Need N+1 prices for N-day cumulative return!
     """
     filtered_pairs = []
 
-    logger.info(
-        f"Applying divergence filter: {lookback_days} days, {divergence_threshold:.1%} threshold"
-    )
-
     for token1, token2 in candidate_pairs:
-        # Check if both tokens exist
         if token1 not in price_data or token2 not in price_data:
             continue
 
-        # Get price series
-        prices1 = price_data[token1]["close"]
-        prices2 = price_data[token2]["close"]
+        df1, df2 = price_data[token1], price_data[token2]
 
-        # ✅ CRITICAL FIX: Need N+1 prices for N-day cumulative return
-        # For 5-day return, need 6 prices: day -5 to day 0
-        if len(prices1) < lookback_days + 1 or len(prices2) < lookback_days + 1:
-            logger.debug(
-                f"Skipping {token1}-{token2}: insufficient data ({len(prices1)}, {len(prices2)} < {lookback_days + 1})"
-            )
+        # Use the smaller of lookback_days+1 or available days
+        effective_lookback = min(lookback_days + 1, len(df1), len(df2))
+        if effective_lookback < 2:
+            # Need at least 2 days to compute return
             continue
 
-        try:
-            # ✅ CORRECT: Calculate cumulative returns over N days
-            # Use index -(N+1) for starting price
-            start_idx = -(lookback_days + 1)
+        # Extract last effective_lookback prices
+        prices1 = df1["close"].iloc[-effective_lookback:].values
+        prices2 = df2["close"].iloc[-effective_lookback:].values
 
-            # Convert to float for safety
-            price1_start = float(prices1.iloc[start_idx])
-            price1_end = float(prices1.iloc[-1])
-            price2_start = float(prices2.iloc[start_idx])
-            price2_end = float(prices2.iloc[-1])
+        # Calculate cumulative returns
+        cum_ret1 = prices1[-1] / prices1[0] - 1.0
+        cum_ret2 = prices2[-1] / prices2[0] - 1.0
 
-            cum_ret1 = (price1_end / price1_start) - 1.0
-            cum_ret2 = (price2_end / price2_start) - 1.0
+        # Calculate divergence
+        divergence = abs(cum_ret1 - cum_ret2)
 
-            # Calculate divergence
-            divergence = abs(cum_ret1 - cum_ret2)
-
-            if divergence >= divergence_threshold:
-                # Determine which token performed better
-                if cum_ret1 > cum_ret2:
-                    long_token, short_token = (
-                        token2,
-                        token1,
-                    )  # Buy underperformer, short outperformer
-                else:
-                    long_token, short_token = token1, token2
-
-                filtered_pairs.append(
-                    {
-                        "pair": (token1, token2),
-                        "long_token": long_token,
-                        "short_token": short_token,
-                        "divergence": float(divergence),
-                        "cum_ret1": float(cum_ret1),
-                        "cum_ret2": float(cum_ret2),
-                        "lookback_days": lookback_days,
-                    }
-                )
-
-                logger.debug(
-                    f"✓ {token1}-{token2}: divergence={divergence:.2%}, Long {long_token}, Short {short_token}"
-                )
-
-        except (ValueError, TypeError, KeyError, IndexError) as e:
-            logger.debug(f"Error calculating divergence for {token1}-{token2}: {e}")
+        # Filter by divergence threshold
+        if divergence < divergence_threshold:
             continue
 
-    logger.info(
-        f"Divergence filter: {len(filtered_pairs)}/{len(candidate_pairs)} pairs passed"
-    )
+        # Long underperformer, short outperformer
+        if cum_ret1 < cum_ret2:
+            long_token, short_token = token1, token2
+        else:
+            long_token, short_token = token2, token1
 
-    # Debug info
-    if filtered_pairs:
-        avg_divergence = np.mean([p["divergence"] for p in filtered_pairs])
-        logger.info(f"Average divergence: {avg_divergence:.2%}")
-        logger.info(
-            f"Range: {min([p['divergence'] for p in filtered_pairs]):.2%} to {max([p['divergence'] for p in filtered_pairs]):.2%}"
+        filtered_pairs.append(
+            {
+                "pair": (token1, token2),
+                "long_token": long_token,
+                "short_token": short_token,
+                "divergence": divergence,
+            }
         )
 
     return filtered_pairs
 
 
 def simulate_pair_trades(
-    filtered_pairs,
-    price_data,
-    week_start,
-    week_end,
-):
-    """
-    ✅ RESEARCH STANDARD (NO TRANSACTION COSTS)
-    Weekly rebalancing with daily close-to-close P&L
-    - Monday: Enter at close
-    - Tuesday–Friday: Daily P&L
-    - Friday: Exit at close
-    """
+    filtered_pairs: List[Dict[str, Any]],
+    price_data: Dict[str, pd.DataFrame],
+    week_start: pd.Timestamp,
+    week_end: pd.Timestamp,
+    transaction_cost: float = 0.001,  # 0.1% per side
+) -> Dict[str, Any]:
 
-    # Get trading days from price data (using a sample token)
-    sample_tokens = list(price_data.keys())
-    if not sample_tokens:
+    total_pairs_selected = len(filtered_pairs)
+
+    if not price_data or total_pairs_selected == 0:
         return {
             "Weekly_Return": 0.0,
             "Daily_Returns": pd.Series(dtype=float),
-            "Active_Pairs": 0,
+            "Total_Pairs_Selected": total_pairs_selected,
+            "Active_Pairs": set(),
         }
 
-    trading_days = price_data[sample_tokens[0]].index
+    trading_days = next(iter(price_data.values())).index
+    week_days = trading_days[(trading_days >= week_start) & (trading_days <= week_end)]
 
-    # Filter for the specific week
-    week_mask = (trading_days >= week_start) & (trading_days <= week_end)
-    week_days = trading_days[week_mask]
-
-    if len(week_days) < 2:  # Need at least 2 days for returns
+    if len(week_days) < 2:
         return {
             "Weekly_Return": 0.0,
-            "Daily_Returns": pd.Series(dtype=float, index=week_days),
-            "Active_Pairs": 0,
+            "Daily_Returns": pd.Series(dtype=float),
+            "Total_Pairs_Selected": total_pairs_selected,
+            "Active_Pairs": set(),
         }
 
-    daily_returns = []
+    n_days = len(week_days)
+    daily_returns: List[float] = []
+    day_traded = set()
 
-    # ✅ MONDAY: Entry day (no cost, no return)
-    daily_returns.append(0.0)
+    traded_this_week = set()
 
-    # ✅ TUESDAY–FRIDAY: Daily P&L
-    for idx in range(1, len(week_days)):
-        current_day = week_days[idx]
-        prev_day = week_days[idx - 1]
+    for i in range(1, n_days):
 
-        day_portfolio_return = 0.0
-        active_pairs = 0
+        prev_day, curr_day = week_days[i - 1], week_days[i]
+        day_ret_sum = 0.0
+        day_traded = set()
 
-        for pair_info in filtered_pairs:
-            token_long = pair_info["long_token"]
-            token_short = pair_info["short_token"]
+        for p in filtered_pairs:
+
+            l, s = p["long_token"], p["short_token"]
 
             if (
-                token_long not in price_data
-                or token_short not in price_data
-                or prev_day not in price_data[token_long].index
-                or current_day not in price_data[token_long].index
-                or prev_day not in price_data[token_short].index
-                or current_day not in price_data[token_short].index
+                l not in price_data
+                or s not in price_data
+                or prev_day not in price_data[l].index
+                or curr_day not in price_data[l].index
+                or prev_day not in price_data[s].index
+                or curr_day not in price_data[s].index
             ):
                 continue
 
-            try:
-                # Ensure we get numeric values
-                price_long_prev = float(price_data[token_long].loc[prev_day, "close"])
-                price_long_curr = float(
-                    price_data[token_long].loc[current_day, "close"]
-                )
-                price_short_prev = float(price_data[token_short].loc[prev_day, "close"])
-                price_short_curr = float(
-                    price_data[token_short].loc[current_day, "close"]
-                )
+            pair = tuple(sorted([l, s]))
 
-                # Calculate returns with explicit float conversion
-                r_long = (price_long_curr / price_long_prev) - 1.0
-                r_short = (price_short_curr / price_short_prev) - 1.0
+            day_traded.add(pair)
+            traded_this_week.add(pair)
 
-                # Equal-weighted pair return
-                pair_daily_return = (r_long - r_short) / 2.0
+            p_l_prev, p_l_curr = price_data[l].loc[[prev_day, curr_day], "close"]
+            p_s_prev, p_s_curr = price_data[s].loc[[prev_day, curr_day], "close"]
 
-                day_portfolio_return += pair_daily_return
-                active_pairs += 1
+            r_long = p_l_curr / p_l_prev - 1.0
+            r_short = p_s_curr / p_s_prev - 1.0
 
-            except (ValueError, TypeError, ZeroDivisionError) as e:
-                logger.debug(
-                    f"Error calculating returns for {token_long}-{token_short}: {e}"
-                )
-                continue
+            pair_ret = (r_long - r_short) / 2.0
 
-        if active_pairs > 0:
-            daily_returns.append(day_portfolio_return / active_pairs)
-        else:
-            daily_returns.append(0.0)
+            day_ret_sum += pair_ret
 
-    # Weekly compounded return
-    if daily_returns:
-        weekly_return = np.prod([1.0 + r for r in daily_returns]) - 1.0
-    else:
-        weekly_return = 0.0
+        valid_pairs = len(day_traded)
 
-    # Create Series with proper index
-    daily_returns_series = pd.Series(
-        daily_returns, index=week_days[: len(daily_returns)]
+        portfolio_day_ret = day_ret_sum / valid_pairs if valid_pairs > 0 else 0.0
+
+        if valid_pairs > 0:
+            # Entry cost on first trading day
+            if i == 1:
+                portfolio_day_ret -= 2.0 * transaction_cost
+
+            # Exit cost on last trading day
+            if i == n_days - 1 and n_days > 2:
+                portfolio_day_ret -= 2.0 * transaction_cost
+
+        daily_returns.append(portfolio_day_ret)
+
+    daily_returns_series = pd.Series(daily_returns, index=week_days[1:])
+
+    # Weekly return now computed from cost-inclusive daily returns
+    weekly_return = (
+        float(np.prod(1.0 + np.array(daily_returns)) - 1.0) if daily_returns else 0.0
     )
 
+    # ✅ No separate cost subtraction needed — already embedded in daily_returns
     return {
         "Weekly_Return": weekly_return,
         "Daily_Returns": daily_returns_series,
-        "Active_Pairs": len(filtered_pairs),
+        "Total_Pairs_Selected": total_pairs_selected,
+        "Active_Pairs": traded_this_week,
+    }
+
+
+# ============================================================
+# EMPTY METRICS
+# ============================================================
+
+
+def create_empty_metrics() -> Dict[str, Any]:
+    return {
+        "Mean_Return": 0.0,
+        "Std_Dev": 0.0,
+        "Sharpe_Ratio": 0.0,
+        "Sortino_Ratio": 0.0,
+        "Max_Drawdown_%": 0.0,
+        "Calmar_Ratio": 0.0,
+        "Profit_Factor": 0.0,
+        "Gross_Profit": 0.0,
+        "Gross_Loss": 0.0,
+        "Daily_Return_Series": pd.Series(dtype=float),
     }
 
 
 def calculate_performance_metrics(
     weekly_results_list: List[Dict[str, Any]],
     result_dir: Path,
-    holding_period_days: int = 5,
-    period_name: str = "test",
+    period_name: str,
     trading_days_per_year: float = 252.0,
+    risk_free_rate_annual: float = 0.0,
 ) -> Dict[str, Any]:
     """
-    RESEARCH-CORRECT PERFORMANCE METRICS (CRYPTO, MARKET-NEUTRAL)
+    Calculate performance metrics for trading strategies or benchmarks.
 
-    Metrics (STANDARD DEFINITIONS):
-    - Sharpe Ratio   = mean(daily return) / std(daily return) * sqrt(252)
-    - Sortino Ratio  = mean(daily return) / downside std * sqrt(252)
-    - Max Drawdown   = max peak-to-trough loss
-    - Profit Factor  = gross profit / gross loss
-    - Calmar Ratio   = annualized return / max drawdown
+    Args:
+        weekly_results_list: List of weekly trading results
+        result_dir: Directory to save results
+        period_name: Name of evaluation period (used to detect benchmarks)
+        trading_days_per_year: Trading days per year (default 252)
+        risk_free_rate_annual: Annual risk-free rate (default 0.0)
 
-    NOTES:
-    - Uses RAW daily returns (NO risk-free rate)
-    - Weekly rebalanced portfolio
-    - Suitable for yearly benchmark comparison
+    Returns:
+        Dictionary of performance metrics
     """
 
-    # ============================================================
-    # 1. VALIDATION
-    # ============================================================
-    if not weekly_results_list:
+    # 1. CONCATENATE DATA
+    daily_series = [
+        w["Daily_Returns"]
+        for w in weekly_results_list
+        if isinstance(w.get("Daily_Returns"), pd.Series)
+        and not w["Daily_Returns"].empty
+    ]
+
+    if not daily_series:
         return create_empty_metrics()
 
-    # ============================================================
-    # 2. COLLECT DAILY RETURNS
-    # ============================================================
-    all_daily_returns = {}
-
-    for week in weekly_results_list:
-        daily_returns = week.get("Daily_Returns")
-        week_start = week["Week_Start"]
-        week_end = week["Week_End"]
-
-        if isinstance(daily_returns, pd.Series) and len(daily_returns) > 0:
-            for d, r in daily_returns.items():
-                all_daily_returns[d] = r
-        else:
-            # fallback (rare)
-            for d in pd.bdate_range(week_start, week_end)[:holding_period_days]:
-                all_daily_returns[d] = 0.0
-
-    if not all_daily_returns:
-        return create_empty_metrics()
-
-    # ============================================================
-    # 3. DAILY RETURN SERIES
-    # ============================================================
-    returns_series = pd.Series(all_daily_returns).sort_index()
-    returns = returns_series.to_numpy(dtype=np.float64)
-    returns = np.nan_to_num(returns)
-
+    returns_series = pd.concat(daily_series).sort_index()
+    returns_series = returns_series[~returns_series.index.duplicated()].dropna()
+    returns = returns_series.to_numpy()
     n_days = len(returns)
+
     if n_days < 2:
         return create_empty_metrics()
 
-    # ============================================================
-    # 4. CORE CALCULATIONS
-    # ============================================================
-    cumulative_returns = np.cumprod(1 + returns)
-    total_return = cumulative_returns[-1] - 1
+    # 2. RISK FREE ADJUSTMENT
+    rf_daily = (1 + risk_free_rate_annual) ** (1 / trading_days_per_year) - 1.0
+    excess = returns - rf_daily
 
-    # ============================================================
-    # 4.1 SHARPE RATIO
-    # ============================================================
-    mean_return = np.mean(returns)
-    std_return = np.std(returns, ddof=1)
+    # 3. PERFORMANCE MATH
+    mean_daily = np.mean(returns)
+    std_daily = np.std(returns, ddof=1)
 
-    sharpe_ratio = (
-        (mean_return / std_return) * np.sqrt(trading_days_per_year)
-        if std_return > 1e-12
+    # Sharpe with Stability Check
+    std_excess = np.std(excess, ddof=1)
+    sharpe = (
+        (np.mean(excess) / std_excess * np.sqrt(trading_days_per_year))
+        if std_excess > 1e-9
         else 0.0
     )
 
-    # ============================================================
-    # 4.2 SORTINO RATIO
-    # ============================================================
-    downside_returns = returns[returns < 0]
-    downside_std = (
-        np.std(downside_returns, ddof=1) if len(downside_returns) > 1 else 0.0
-    )
-
-    sortino_ratio = (
-        (mean_return / downside_std) * np.sqrt(trading_days_per_year)
-        if downside_std > 1e-12
+    # Sortino (Downside Risk Only)
+    downside_returns = excess[excess < 0]
+    # We use the full n_days in the denominator for the downside deviation (Standard Way)
+    downside_deviation = np.sqrt(np.sum(downside_returns**2) / n_days)
+    sortino = (
+        (np.mean(excess) / downside_deviation * np.sqrt(trading_days_per_year))
+        if downside_deviation > 1e-9
         else 0.0
     )
 
-    # ============================================================
-    # 4.3 MAXIMUM DRAWDOWN
-    # ============================================================
-    running_max = np.maximum.accumulate(cumulative_returns)
-    drawdowns = (running_max - cumulative_returns) / running_max
-    max_drawdown = np.max(drawdowns)
+    # 4. DRAWDOWN & CAGR
+    cumulative = np.cumprod(1 + returns)
+    running_max = np.maximum.accumulate(cumulative)
+    drawdowns = (running_max - cumulative) / running_max
+    max_dd = np.max(drawdowns)
 
-    # ============================================================
-    # 4.4 PROFIT FACTOR
-    # ============================================================
+    # CAGR
+    cagr = (cumulative[-1] ** (trading_days_per_year / n_days)) - 1.0
+    calmar = cagr / max_dd if max_dd > 0 else 0.0
+
+    # 5. PROFIT FACTOR
     gross_profit = np.sum(returns[returns > 0])
-    gross_loss = np.abs(np.sum(returns[returns < 0]))
+    gross_loss = abs(np.sum(returns[returns < 0]))
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0.0
 
-    if gross_loss > 1e-12:
-        profit_factor = gross_profit / gross_loss
-    elif gross_profit > 0:
-        profit_factor = np.inf
+    # 6. TURNOVER CALCULATION - DISTINGUISH BENCHMARKS FROM PAIR TRADING
+    if period_name in ["btc_benchmark", "index_benchmark"]:
+        # Buy-and-hold benchmarks have ZERO turnover
+        annualized_turnover = 0.0
+        logger.debug(f"{period_name}: Turnover set to 0.00% (buy-and-hold strategy)")
     else:
-        profit_factor = 0.0
+        # Pair trading strategies: Calculate actual turnover
+        weekly_pair_sets = [set(w.get("Active_Pairs", [])) for w in weekly_results_list]
 
-    # ============================================================
-    # 4.5 CALMAR RATIO
-    # ============================================================
-    annualized_return = (1 + total_return) ** (trading_days_per_year / n_days) - 1
+        weekly_turnovers = []
+        prev_pairs = None
 
-    calmar_ratio = annualized_return / max_drawdown if max_drawdown > 1e-12 else 0.0
+        for current_pairs in weekly_pair_sets:
+            if prev_pairs is None:
+                prev_pairs = current_pairs
+                continue
 
-    # ============================================================
-    # 5. SAVE ANALYSIS
-    # ============================================================
-    analysis_df = pd.DataFrame(
-        {
-            "Date": returns_series.index,
-            "Daily_Return": returns,
-            "Cumulative_Return": cumulative_returns,
-            "Drawdown_%": drawdowns * 100,
-        }
-    )
-    analysis_df.to_csv(result_dir / f"{period_name}_analysis.csv", index=False)
+            # Symmetric difference: Elements in either prev or current, but not both
+            changes = len(current_pairs.symmetric_difference(prev_pairs))
 
-    # ============================================================
-    # 6. RETURN METRICS
-    # ============================================================
+            # Average size over the transition period
+            avg_size = (len(current_pairs) + len(prev_pairs)) / 2.0
+
+            # Normalizing by 2.0 * avg_size ensures 100% = full portfolio replacement
+            weekly_turnover = changes / (2.0 * avg_size) if avg_size > 0 else 0.0
+
+            weekly_turnovers.append(weekly_turnover)
+            prev_pairs = current_pairs
+
+        mean_weekly_turnover = np.mean(weekly_turnovers) if weekly_turnovers else 0.0
+        annualized_turnover = mean_weekly_turnover * 52
+
+        logger.debug(
+            f"{period_name}: Calculated turnover = {annualized_turnover * 100:.2f}%"
+        )
+
+    # 7. EXPORT & RETURN
+    ensure_dir(result_dir)
+
     return {
-        "Sharpe_Ratio": round(sharpe_ratio, 4),
-        "Sortino_Ratio": round(sortino_ratio, 4),
-        "Max_Drawdown_%": round(max_drawdown * 100, 4),
+        "Mean_Return": mean_daily * 100,
+        "Std_Dev": std_daily * 100,
+        "Downside_Deviation": round(downside_deviation * 100, 6),
+        "Sharpe_Ratio": round(sharpe, 4),
+        "Sortino_Ratio": round(sortino, 4),
+        "Max_Drawdown_%": round(max_dd * 100, 2),
+        "Calmar_Ratio": round(calmar, 4),
         "Profit_Factor": round(profit_factor, 4),
-        "Calmar_Ratio": round(calmar_ratio, 4),
-        "Total_Return_%": round(total_return * 100, 4),
-        "Annualized_Return_%": round(annualized_return * 100, 4),
-        "Total_Trading_Days": n_days,
-    }
-
-
-def create_empty_metrics() -> Dict[str, Any]:
-    """Return zero metrics for failed cases"""
-    return {
-        "Sharpe_Ratio": 0.0,
-        "Sortino_Ratio": 0.0,
-        "Max_Drawdown_%": 0.0,
-        "Profit_Factor": 0.0,
-        "Calmar_Ratio": 0.0,
-        "Total_Return_%": 0.0,
-        "Annualized_Return_%": 0.0,
-        "Total_Trading_Days": 0,
-    }
-
-
-def create_weekly_result(
-    week_number: int,
-    week_start: pd.Timestamp,
-    week_end: pd.Timestamp,
-    lookback_start: pd.Timestamp,
-    lookback_end: pd.Timestamp,
-    information_cutoff: pd.Timestamp,
-    num_selected: int,
-    num_filtered: int,
-    weekly_return_pct: float,
-    daily_returns: Union[pd.Series, float],
-) -> Dict[str, Any]:
-    """
-    Helper function to create standardized weekly result dict
-    """
-    return {
-        "Week_Number": week_number,
-        "Week_Start": week_start,
-        "Week_End": week_end,
-        "Lookback_Start": lookback_start,
-        "Lookback_End": lookback_end,
-        "Information_Cutoff": information_cutoff,
-        "Num_Selected_Pairs": num_selected,
-        "Num_Filtered_Pairs": num_filtered,
-        "Weekly_Return_%": weekly_return_pct,
-        "Daily_Returns": daily_returns,
+        "Gross_Profit": gross_profit * 100,
+        "Gross_Loss": gross_loss * 100,
+        "Daily_Return_Series": returns_series,
     }

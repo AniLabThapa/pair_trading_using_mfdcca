@@ -1,6 +1,6 @@
 """
 Unified Feature Extraction Layer
-Single implementation used by both precompute and live computation paths
+TRUSTS DATA ALIGNMENT from data_processing.py
 """
 
 import torch
@@ -8,19 +8,20 @@ import logging
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Tuple, Any, Optional
-import torch
 from config import CONFIG, DEVICE
 from mfdcca import process_token_pairs, extract_hurst_matrices
-import statsmodels.api as sm
-from statsmodels.tsa.stattools import adfuller
-from statsmodels.tsa.stattools import coint
 
+import statsmodels.api as sm
+from statsmodels.tsa.stattools import coint
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# MFDCCA FEATURE EXTRACTION (Single Implementation)
+# MFDCCA FEATURE EXTRACTION
+# ============================================================================
+
+
 def extract_mfdcca_features(
     residuals: Dict[str, pd.Series],
     token_list: List[str],
@@ -29,44 +30,29 @@ def extract_mfdcca_features(
     lookback_end: pd.Timestamp,
 ) -> Dict[str, Any]:
     """
-    ✅ BALANCED: Minimal validation without redundancy
+    Extract MF-DCCA features from pre-filtered residuals.
     """
+    logger.info(f" MFDCCA: {lookback_start.date()} to {lookback_end.date()}")
 
-    logger.info(f"MFDCCA: {lookback_start.date()} to {lookback_end.date()}")
+    valid_tokens = [token for token in token_list if token in residuals]
 
-    # 1. Basic validation
-    if not isinstance(residuals, dict):
-        return {"has_data": False}
-
-    # 2. Get tokens with sufficient data
-    valid_tokens = []
-    for token in token_list:
-        if token in residuals:
-            series = residuals[token]
-            if isinstance(series, pd.Series) and len(series) >= 90:
-                valid_tokens.append(token)
-
-    if len(valid_tokens) < 2:
-        return {"has_data": False}
-
-    logger.info(f"MFDCCA: {len(valid_tokens)} tokens")
-
-    # 3. Run MFDCCA (no date filtering - trust pipeline)
+    # Run MFDCCA directly on residuals
     results = process_token_pairs(
         token_list=valid_tokens,
-        residuals={t: residuals[t] for t in valid_tokens},
+        residuals=residuals,
         q_list=q_list,
     )
 
     if not results:
+        logger.warning("MFDCCA: No results generated")
         return {"has_data": False}
 
-    # 4. Extract matrices
+    # Extract matrices
     hxy_matrix, delta_H_matrix, delta_alpha_matrix = extract_hurst_matrices(
         token_list=valid_tokens, results=results, q_list=q_list
     )
 
-    logger.info(f"✅ MFDCCA: {len(results)} pairs")
+    logger.info(f"✅ MFDCCA: {len(results)} pairs analyzed")
 
     return {
         "has_data": True,
@@ -75,66 +61,124 @@ def extract_mfdcca_features(
         "delta_alpha_matrix": delta_alpha_matrix,
         "q_list": q_list,
         "num_pairs": len(results),
-        "tokens_used": valid_tokens,
+        "token_list": valid_tokens,
+        "lookback_start": lookback_start,
+        "lookback_end": lookback_end,
     }
 
 
 # ============================================================================
-# DCCA FEATURE EXTRACTION (Single Implementation)
+# DCCA FEATURE EXTRACTION - FIXED
 # ============================================================================
-
-
 def extract_dcca_features(
     residuals: Dict[str, pd.Series],
     token_list: List[str],
-    window: int,
-    max_scale_ratio: float = 0.25,
-    eps: float = 1e-16,
-    device=None,
+    lookback_start: pd.Timestamp,
+    lookback_end: pd.Timestamp,
+    min_scale: int = 10,
+    num_scales: int = 20,
+    eps: float = 1e-12,
+    device: Optional[torch.device] = None,
 ) -> Dict[Tuple[str, str], Dict[str, Any]]:
     """
-    Pure GPU implementation of DCCA.
+    Extract DCCA features from pre-validated residuals.
+    NOTE: Residuals are already validated and aligned by CAPM.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    logger.info(f"📊 Extracting DCCA features on {device}...")
+    logger.info(f" Running DCCA on {device}")
+    logger.info(f"DCCA Period: {lookback_start.date()} to {lookback_end.date()}")
 
-    if window < 90:
-        return {}
-
-    # Build profiles on GPU
+    # 1. Profile Creation with Mean Removal
     profiles = {}
-    valid_tokens = []
     for token in token_list:
-        if token not in residuals:
-            continue
-        series = residuals[token].dropna()
-        if len(series) < 90:
-            continue
-        # Direct to GPU
-        x = torch.tensor(series.values, device=device, dtype=torch.float32)
-        profile = torch.cumsum(x - x.mean(), dim=0)
-        profiles[token] = profile
-        valid_tokens.append(token)
+        # Convert to tensor
+        data = torch.tensor(residuals[token].values, device=device, dtype=torch.float32)
+        # Explicit Mean Removal
+        centered_data = data - torch.mean(data)
+        # Cumulative Sum to create the Profile (Random Walk)
+        profiles[token] = torch.cumsum(centered_data, dim=0)
 
-    if len(valid_tokens) < 2:
-        return {}
+    logger.info(f"DCCA: Processing {len(profiles)} tokens")
+
+    valid_tokens = list(profiles.keys())
+
+    logger.info(f"DCCA: Processing {len(valid_tokens)} tokens")
 
     N = len(next(iter(profiles.values())))
-    min_scale = 10
-    max_scale = min(int(N * max_scale_ratio), N - 10)
-    step = max(5, (max_scale - min_scale) // 10)
 
-    # Generate scales on GPU
-    scales_tensor = torch.arange(
-        min_scale, max_scale + 1, step, device=device, dtype=torch.float32
-    )
-    scales_tensor = scales_tensor[(N - scales_tensor + 1) >= 10]
-
-    if len(scales_tensor) < 4:
+    max_scale = min(int(N / 4), N - 5)
+    if max_scale <= min_scale:
+        logger.warning("DCCA: Invalid scale range")
         return {}
 
+    # --------------------------------------------------
+    # 2. Logarithmic scale selection
+    # --------------------------------------------------
+    if min_scale >= max_scale:
+        min_scale = max_scale // 2
+
+    scales = np.logspace(
+        np.log10(float(min_scale)),
+        np.log10(float(max_scale)),
+        num=num_scales,
+        dtype=int,
+    )
+    scales = np.unique(scales)
+    scales = [int(s) for s in scales if (N - s + 1) >= 5]
+
+    if len(scales) < 4:
+        logger.warning(f"DCCA: Insufficient scales (N={N}, scales={scales})")
+        return {}
+
+    # --------------------------------------------------
+    # 3. Batch detrend function
+    # --------------------------------------------------
+    def batch_detrend(segments: torch.Tensor) -> torch.Tensor:
+        """
+        Batch detrend segments using linear least squares.
+
+        Parameters
+        ----------
+        segments : torch.Tensor
+            Shape (n_boxes, s)
+
+        Returns
+        -------
+        torch.Tensor
+            Detrended segments, same shape
+        """
+        n_boxes, s = segments.shape
+
+        # Create time indices for linear regression
+        t = torch.arange(s, device=device, dtype=torch.float32)
+
+        # Design matrix for linear regression: [t, 1]
+        A = torch.stack([t, torch.ones_like(t)], dim=1)  # (s, 2)
+        ATA = A.T @ A  # (2, 2)
+
+        # Solve for all boxes simultaneously
+        seg_reshaped = segments.unsqueeze(-1)  # (n_boxes, s, 1)
+        ATb = torch.matmul(A.T.unsqueeze(0), seg_reshaped)  # (n_boxes, 2, 1)
+        ATA_inv = torch.linalg.inv(ATA)  # (2, 2)
+        theta = torch.matmul(ATA_inv.unsqueeze(0), ATb)  # (n_boxes, 2, 1)
+
+        # Compute trends: trend = A @ theta
+        theta_expanded = theta.squeeze(-1).unsqueeze(1)  # (n_boxes, 1, 2)
+        A_expanded = A.unsqueeze(0)  # (1, s, 2)
+        trend = torch.matmul(
+            A_expanded, theta_expanded.transpose(1, 2)
+        )  # (n_boxes, s, 1)
+
+        # Detrend
+        detrended = segments - trend.squeeze(-1)  # (n_boxes, s)
+
+        return detrended
+
+    # --------------------------------------------------
+    # 4. Pairwise DCCA (Pure DCCA with H_xy)
+    # --------------------------------------------------
     dcca_features = {}
 
     for i in range(len(valid_tokens)):
@@ -143,160 +187,122 @@ def extract_dcca_features(
             X = profiles[t1]
             Y = profiles[t2]
 
-            signed_F2_by_scale = {}
-            magnitudes_list = []
-            signs_list = []
-            scales_list = []
+            F2_dcca_vals = []
+            F2_dfa_x_vals = []
+            F2_dfa_y_vals = []
+            rho_vals = []
+            used_scales = []
 
-            for s in scales_tensor.int().tolist():
-                s_int = int(s)
-                N = X.shape[0]
-                Ns = N // s  # number of segments
+            for s in scales:
+                n_boxes = N - s + 1
 
-                # Trim series so it divides exactly into Ns segments
-                X_trim = X[: Ns * s]
-                Y_trim = Y[: Ns * s]
+                # Extract overlapping boxes
+                X_2d = X.unsqueeze(0).unsqueeze(-1)  # (1, N, 1)
+                Y_2d = Y.unsqueeze(0).unsqueeze(-1)
 
-                # Non-overlapping segmentation (stride = s)
-                seg_x = X_trim.view(Ns, s)
-                seg_y = Y_trim.view(Ns, s)
+                seg_x = (
+                    torch.nn.functional.unfold(X_2d, kernel_size=(s, 1), stride=(1, 1))
+                    .squeeze(0)
+                    .T
+                )  # (n_boxes, s)
 
-                t = torch.arange(s_int, device=device, dtype=torch.float32)
-                A = torch.stack([t, torch.ones_like(t)], dim=1)
+                seg_y = (
+                    torch.nn.functional.unfold(Y_2d, kernel_size=(s, 1), stride=(1, 1))
+                    .squeeze(0)
+                    .T
+                )  # (n_boxes, s)
 
-                # GPU linear solve
-                ATA = A.T @ A
-                C = torch.linalg.solve(ATA, A.T)
+                # Batch detrend
+                dx = batch_detrend(seg_x)
+                dy = batch_detrend(seg_y)
 
-                beta_x = seg_x @ C.T
-                beta_y = seg_y @ C.T
-                fit_x = beta_x @ A.T
-                fit_y = beta_y @ A.T
+                # Local fluctuations (Eq. 3) - use (s-1) divisor
+                f2_dfa_x = (dx**2).sum(dim=1) / (s - 1)
+                f2_dfa_y = (dy**2).sum(dim=1) / (s - 1)
+                f2_dcca = (dx * dy).sum(dim=1) / (s - 1)
 
-                dx = seg_x - fit_x
-                dy = seg_y - fit_y
+                # Scale-averaged (Eq. 4)
+                F2_x = f2_dfa_x.mean()
+                F2_y = f2_dfa_y.mean()
+                F2_xy = f2_dcca.mean()
 
-                f2_nu = (dx * dy).sum(dim=1) / (s_int - 1)
-                F2_s = f2_nu.mean().item()
-                signed_F2_by_scale[s_int] = F2_s
+                # DCCA correlation coefficient (Eq. 5)
+                denom = torch.sqrt(F2_x * F2_y)
+                rho = F2_xy / (denom + eps)
+                rho = torch.clamp(rho, -1.0, 1.0)
 
-                magnitude = torch.sqrt(torch.abs(torch.tensor(F2_s)) + eps)
-                magnitudes_list.append(magnitude)
-                signs_list.append(torch.sign(torch.tensor(F2_s)).int().item())
-                scales_list.append(s_int)
+                # Store results
+                F2_dcca_vals.append(F2_xy.item())
+                F2_dfa_x_vals.append(F2_x.item())
+                F2_dfa_y_vals.append(F2_y.item())
+                rho_vals.append(rho.item())
+                used_scales.append(s)
 
-            if len(scales_list) < 4:
+            if len(used_scales) < 4:
                 continue
 
-            # PURE GPU REGRESSION
-            scales_gpu = torch.tensor(scales_list, dtype=torch.float32, device=device)
-            magnitudes_gpu = torch.tensor(
-                magnitudes_list, dtype=torch.float32, device=device
+            # --------------------------------------------------
+            # 5. H_xy estimation from scaling law
+            # F²_DCCA(s) ~ s^(2H_xy)
+            # --------------------------------------------------
+            log_s = torch.log(
+                torch.tensor(used_scales, device=device, dtype=torch.float32)
             )
+            F2_tensor = torch.tensor(F2_dcca_vals, device=device)
 
-            log_s = torch.log(scales_gpu)
-            log_F = torch.log(magnitudes_gpu)
+            log_F2 = torch.log(F2_tensor)
 
-            # GPU linear regression
             A = torch.stack([log_s, torch.ones_like(log_s)], dim=1)
-            ATA = A.T @ A
-            ATb = A.T @ log_F
-            theta = torch.linalg.solve(ATA, ATb)
-            H_xy = theta[0].item()
+            theta = torch.linalg.lstsq(A, log_F2).solution
 
-            # GPU correlation coefficient
-            cov = torch.cov(torch.stack([log_s, log_F]))
-            R2 = (
-                cov[0, 1] / (torch.sqrt(cov[0, 0]) * torch.sqrt(cov[1, 1]))
-            ).item() ** 2
+            H_xy = (theta[0] / 2.0).item()
 
-            dcca_features[(t1, t2)] = {
+            # Store pure DCCA features (no quality score, no R²)
+            pair_key = tuple(sorted([t1, t2]))
+            dcca_features[pair_key] = {
                 "H_xy": H_xy,
-                "signed_F2_by_scale": signed_F2_by_scale,
-                "magnitudes": [m.item() for m in magnitudes_list],
-                "signs": signs_list,
-                "used_scales": scales_list,
-                "scales_count": len(scales_list),
-                "R_squared": R2,
+                "mean_rho": float(np.mean(rho_vals)),
+                "mean_abs_rho": float(np.mean(np.abs(rho_vals))),
+                "rho_by_scale": dict(zip(used_scales, rho_vals)),
+                "F2_dcca_by_scale": dict(zip(used_scales, F2_dcca_vals)),
+                "scales_used": used_scales,
             }
 
-    logger.info(f"✅ PURE GPU DCCA completed: {len(dcca_features)} pairs analyzed")
+    logger.info(f"✅ DCCA completed: {len(dcca_features)} pairs")
     return dcca_features
 
 
 # ============================================================================
-# PEARSON FEATURE EXTRACTION (Single Implementation)
+# PEARSON FEATURE EXTRACTION
 # ============================================================================
-
-
 def extract_pearson_features(
     residuals: Dict[str, pd.Series],
     token_list: List[str],
-    window: int,
-    lookback_start: Optional[pd.Timestamp] = None,
-    lookback_end: Optional[pd.Timestamp] = None,
+    lookback_start: pd.Timestamp,
+    lookback_end: pd.Timestamp,
 ) -> Dict[str, Any]:
-    """
-    ✅ STANDARD: Pearson correlation with consistent date range
-    Note: Data is already date-aligned by data_processing pipeline
-    """
-    logger.info(f"📈 Extracting Pearson features (RESEARCH Step 6)...")
-    logger.info(f"   Window: {window} days")
 
-    # ====================================================
-    # MINIMAL VERIFICATION (2 lines)
-    # ====================================================
-    # Quick sanity check: verify data_processing did its job
-    if token_list and token_list[0] in residuals:
-        reference_length = len(residuals[token_list[0]])
-        logger.debug(f"Reference token {token_list[0]} has {reference_length} days")
-    # ====================================================
+    logger.info(f"📈 Pearson: {lookback_start.date()} to {lookback_end.date()}")
 
-    res_dict = {}
-    valid_tokens = []
+    # ✅ SIMPLIFIED - token_list matches residuals.keys()
+    res_stack = torch.stack(
+        [
+            torch.tensor(residuals[token].values, device=DEVICE, dtype=torch.float32)
+            for token in token_list
+        ]
+    )
 
-    for token in token_list:
-        if token not in residuals:
-            continue
-
-        series = residuals[token]
-
-        # Optional date filtering
-        if lookback_start is not None and lookback_end is not None:
-            mask = (series.index >= lookback_start) & (series.index <= lookback_end)
-            filtered = series[mask]
-        else:
-            filtered = series
-
-        # Use window parameter (from CAPM)
-        if len(filtered) < 90:
-            logger.debug(
-                f"Token {token}: insufficient data ({len(filtered)} < {window})"
-            )
-            continue
-
-        res_gpu = torch.tensor(filtered.values, device=DEVICE, dtype=torch.float32)
-        res_dict[token] = res_gpu.float()
-        valid_tokens.append(token)
-
-    if len(valid_tokens) < 2:
-        return {"has_data": False}
-
-    res_stack = torch.stack([res_dict[token] for token in valid_tokens])
+    logger.info(f"Pearson: Processing {len(token_list)} tokens")
 
     try:
         corr_matrix = torch.corrcoef(res_stack)
-        logger.info(
-            f"✅ Pearson: {len(valid_tokens)} tokens, {len(res_stack[0])} aligned days"
-        )
+        logger.info(f"✅ Pearson: {len(token_list)} tokens, {res_stack.shape[1]} days")
 
         return {
             "has_data": True,
             "correlation_matrix": corr_matrix,
-            "token_list": valid_tokens,
-            "n_observations": len(res_stack[0]),
-            "window_used": window,
-            "alignment_status": "verified_by_data_processing",  # For documentation
+            "token_list": token_list,
+            "n_observations": res_stack.shape[1],
         }
     except Exception as e:
         logger.error(f"Pearson failed: {e}")
@@ -306,23 +312,7 @@ def extract_pearson_features(
 # ============================================================================
 # COINTEGRATION FEATURE EXTRACTION
 # ============================================================================
-
-
-from statsmodels.tsa.stattools import coint
-import numpy as np
-import pandas as pd
-import logging
-from typing import Dict, List, Tuple, Any
-
-logger = logging.getLogger(__name__)
-
-from typing import Dict, Tuple, Any, List
-import numpy as np
-import pandas as pd
-import logging
-from statsmodels.tsa.stattools import coint
-
-logger = logging.getLogger(__name__)
+# feature_extraction.py - extract_cointegration_features()
 
 
 def extract_cointegration_features(
@@ -331,60 +321,54 @@ def extract_cointegration_features(
     lookback_start: pd.Timestamp,
     lookback_end: pd.Timestamp,
 ) -> Dict[Tuple[str, str], Dict[str, Any]]:
-    """
-    ✅ PURE STANDARD ENGLE–GRANGER COINTEGRATION (PAIR SELECTION ONLY)
 
-    Procedure:
-    1. Log prices
-    2. Engle–Granger two-step test via statsmodels.coint()
-       - OLS regression (internal)
-       - ADF test on residuals
-    3. Use ONLY p-value for pair selection
+    logger.info("🔗 Cointegration: Engle-Granger test...")
 
-    """
+    clean_data = {
+        token: np.log(
+            price_data[token].loc[lookback_start:lookback_end, "close"].values
+        )
+        for token in token_list
+        if token in price_data
+    }
 
-    logger.info("🔗 Extracting PURE Engle–Granger cointegration features...")
-
-    clean_data = {}
-
-    # ─────────────────────────────────────────────
-    # STEP 1: Prepare log-price series
-    # ─────────────────────────────────────────────
-    for token in token_list:
-        if token not in price_data:
-            continue
-
-        df = price_data[token]
-        mask = (df.index >= lookback_start) & (df.index <= lookback_end)
-
-        if mask.sum() >= 60:
-            clean_data[token] = np.log(df.loc[mask, "close"].values)
+    n = len(clean_data)
+    if n < 2:
+        logger.warning(f"Cointegration: Insufficient tokens ({n} < 2)")
+        return {}
 
     valid_tokens = list(clean_data.keys())
-    n = len(valid_tokens)
     n_pairs = n * (n - 1) // 2
-
-    logger.info(f"   Tokens: {n}, Pairs tested: {n_pairs}")
-
     features = {}
     valid_pairs = 0
 
-    # ─────────────────────────────────────────────
-    # STEP 2: Engle–Granger test
-    # ─────────────────────────────────────────────
+    # --- WITHIN THE NESTED LOOP ---
     for i in range(n):
         for j in range(i + 1, n):
-            t1, t2 = valid_tokens[i], valid_tokens[j]
-            y = clean_data[t1]
-            x = clean_data[t2]
+            t_original_1, t_original_2 = valid_tokens[i], valid_tokens[j]
+            y, x = clean_data[t_original_1], clean_data[t_original_2]
 
             try:
-                t_stat, pvalue, crit = coint(y, x, autolag="BIC")
+                # Keep your existing logic for testing both directions
+                t1_stat, p1, crit1 = coint(y, x, autolag="BIC")
+                t2_stat, p2, crit2 = coint(x, y, autolag="BIC")
+
+                if np.isnan(p1) or np.isnan(p2):
+                    continue
+
+                # Selection of stronger p-value
+                if p1 < p2:
+                    pvalue, t_stat, crit = p1, t1_stat, crit1
+                else:
+                    pvalue, t_stat, crit = p2, t2_stat, crit2
 
                 if np.isnan(pvalue) or np.isinf(pvalue):
                     continue
 
-                features[(t1, t2)] = {
+                # ✅ THE FIX: Create a canonical (alphabetical) key
+                pair_key = tuple(sorted([t_original_1, t_original_2]))
+
+                features[pair_key] = {
                     "pvalue": float(pvalue),
                     "t_stat": float(t_stat),
                     "crit_1pct": float(crit[0]),
@@ -392,12 +376,10 @@ def extract_cointegration_features(
                     "crit_10pct": float(crit[2]),
                     "n_obs": len(y),
                 }
-
                 valid_pairs += 1
 
             except Exception:
                 continue
 
-    logger.info(f"✅ Engle–Granger completed: {valid_pairs}/{n_pairs} valid tests")
-
+    logger.info(f"✅ Cointegration: {valid_pairs}/{n_pairs} valid tests")
     return features

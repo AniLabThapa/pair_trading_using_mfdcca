@@ -1,40 +1,46 @@
 from joblib import Parallel, delayed
 import logging
 import pandas as pd
+import numpy as np
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from config import CONFIG
 
 logger = logging.getLogger(__name__)
 
 # Global cache for full data (loaded once)
-_full_data_cache: Dict = {}
+_full_data_cache: Dict[str, pd.DataFrame] = {}
 
 
 def load_single_token(file_path: Path, token: str) -> Optional[pd.DataFrame]:
-    """Load single token data - SIMPLIFIED"""
     try:
         df = pd.read_csv(file_path)
-
-        # Your data has "Date" and "Price" columns
         df = df[["Date", "Price"]].rename(columns={"Date": "date", "Price": "close"})
 
-        # Parse date (MM/DD/YYYY format)
-        df["date"] = pd.to_datetime(df["date"], format="%m/%d/%Y", errors="coerce")
+        # Parse dates
+        df["date"] = pd.to_datetime(df["date"], format="mixed", errors="coerce")
+        df = df.dropna(subset=["date"])
 
-        # Parse price (remove commas)
+        # Set date as index
+        df = df.set_index("date").sort_index()
+
+        # Filter weekdays (business days only)
+        # Monday=0, Sunday=6 - keep only Monday-Friday (0-4)
+        dates = pd.DatetimeIndex(df.index.to_numpy())
+        df = df[dates.dayofweek < 5]
+
+        # Clean prices
         df["close"] = pd.to_numeric(
             df["close"].astype(str).str.replace(",", ""), errors="coerce"
         )
-
-        # Clean data
-        df = df.dropna(subset=["date", "close"])
-        df = df[df["close"] > 0]
+        df = df.dropna(subset=["close"])
 
         if len(df) == 0:
+            logger.warning(f"{token}: No data after cleaning")
             return None
 
-        return df.set_index("date").sort_index()
+        logger.debug(f"✅ {token}: Loaded {len(df)} days")
+        return df
 
     except Exception as e:
         logger.error(f"Failed to load {token}: {e}")
@@ -42,153 +48,108 @@ def load_single_token(file_path: Path, token: str) -> Optional[pd.DataFrame]:
 
 
 def load_all_token_data_cached(
-    start_date, end_date, market_index: str
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+    market_index: str,
 ) -> Dict[str, pd.DataFrame]:
     """
-    ✅ CLEAN & CORRECT: Align all tokens to INDEX business days
-    Returns dict of DataFrames with common business days
+    Load cleaned token data from cache, filter by period,
+    align to INDEX business days, and return common-date dataset.
     """
     global _full_data_cache
 
-    # Load cache if empty
+    # ------------------------------------------------------------------
+    # 1. LOAD & CACHE CLEANED DATA (CSV READ HAPPENS ONLY ONCE)
+    # ------------------------------------------------------------------
     if not _full_data_cache:
-        logger.info("📥 Loading data cache...")
+        logger.info("📥 Loading full data cache from CSV files...")
         tokens_to_load = list(set(CONFIG["token_names"] + [market_index]))
 
-        # Parallel loading
         results = Parallel(n_jobs=-1)(
             delayed(load_single_token)(CONFIG["data_dir"] / f"{token}.csv", token)
             for token in tokens_to_load
         )
 
-        # Store in cache
         for token, df in zip(tokens_to_load, results):
             if df is not None:
                 _full_data_cache[token] = df
 
-        logger.info(f"✅ Cache loaded: {len(_full_data_cache)} tokens")
+        logger.info(f"✅ Cached {len(_full_data_cache)} cleaned datasets")
 
-    # Get INDEX data (business days only)
     if market_index not in _full_data_cache:
-        logger.error(f"❌ {market_index} not in cache")
+        logger.error(f"❌ Market index '{market_index}' missing from cache")
         return {}
 
+    # ------------------------------------------------------------------
+    # 2. FILTER INDEX TO REQUESTED PERIOD
+    # ------------------------------------------------------------------
     index_data = _full_data_cache[market_index].loc[start_date:end_date]
-    if len(index_data) == 0:
+
+    if index_data.empty:
         logger.error(
-            f"❌ No INDEX data in period {start_date.date()} to {end_date.date()}"
+            f"❌ No INDEX data between {start_date.date()} and {end_date.date()}"
         )
         return {}
 
     index_dates = index_data.index
-    logger.info(f"📅 INDEX has {len(index_dates)} business days in period")
+    logger.info(
+        f"📅 INDEX range: {index_dates[0].date()} → {index_dates[-1].date()} "
+        f"({len(index_dates)} business days)"
+    )
 
-    # Align all tokens to INDEX dates
+    # ------------------------------------------------------------------
+    # 3. ALIGN TOKENS & INTERSECT COMMON DATES (single, clean)
+    # ------------------------------------------------------------------
     aligned_data = {market_index: index_data}
-
     aligned_tokens = []
+
     for token in CONFIG["token_names"]:
         if token not in _full_data_cache:
-            logger.debug(f"Skipping {token}: not in cache")
             continue
 
         token_data = _full_data_cache[token].loc[start_date:end_date]
-        if len(token_data) == 0:
-            logger.debug(f"Skipping {token}: no data in period")
+        if token_data.empty:
             continue
 
-        # ✅ SIMPLE: Align to INDEX business days
-        token_aligned = token_data.reindex(index_dates).dropna()
+        aligned_data[token] = token_data
+        aligned_tokens.append(token)
 
-        if len(token_aligned) > 0:
-            aligned_data[token] = token_aligned
-            aligned_tokens.append(token)
-            logger.debug(f"✅ {token}: {len(token_aligned)} days aligned")
+    # True intersection for strictly common business days
+    common_dates = index_data.index
+    for token in aligned_tokens:
+        common_dates = common_dates.intersection(aligned_data[token].index)
 
-    logger.info(f"📊 {len(aligned_tokens)} tokens aligned to INDEX dates")
-
-    # Find common dates (INDEX dates that exist in ALL tokens)
-    common_dates = index_dates
-    logger.info(f"✔ ALIGN start: {len(common_dates)} INDEX days")
-
-    for token, df in aligned_data.items():
-        if token == market_index:
-            continue
-
-        before = len(common_dates)
-        common_dates = common_dates.intersection(df.index)
-        after = len(common_dates)
-
-        if after == 0:
-            logger.error(f"❌ {token}: NO common dates left")
-            raise RuntimeError(f"Alignment failed at {token}")
-
-        elif after < before:
-            logger.warning(f"⚠ {token}: {before} → {after} days")
-
-        else:
-            logger.debug(f"✔ {token}: no date loss ({after})")
+    if common_dates.empty:
+        logger.error("❌ No common dates across all assets")
+        return {}
 
     common_dates = common_dates.sort_values()
-    logger.info(f"✔ ALIGN done: {len(common_dates)} common days")
 
-    # Create final aligned data
-    final_data = {}
-    for token in aligned_data:
-        final_data[token] = aligned_data[token].loc[common_dates]
-    logger.info(f"\n{'='*60}")
-    logger.info(f"✅ DATA ALIGNMENT COMPLETE")
-    logger.info(f"{'='*60}")
-    logger.info(f"   Tokens: {len(final_data)}")
-    logger.info(f"   Common business days: {len(common_dates)}")
-    logger.info(f"   Date range: {common_dates[0].date()} to {common_dates[-1].date()}")
-    logger.info(f"{'='*60}")
-
-    # ===============================
-    # FINAL COMMON-DATE VERIFICATION
-    # ===============================
-    logger.info("🔍 DATA PROCESSING FINAL CHECK")
-
-    reference_index = final_data[market_index].index
-
-    for token, df in final_data.items():
-        same_dates = reference_index.equals(df.index)
-
-        logger.info(
-            f"   {token:<10} | "
-            f"rows={len(df):4d} | "
-            f"dates_match_index={same_dates}"
-        )
-
-        if not same_dates:
-            logger.error(f"❌ Date mismatch detected for {token}")
-            raise RuntimeError(f"Date alignment failed for {token}")
+    # Final strictly-aligned dataset
+    final_data = {token: df.loc[common_dates] for token, df in aligned_data.items()}
 
     logger.info(
-        f"✅ ALL TOKENS + INDEX SHARE IDENTICAL DATES "
-        f"({reference_index[0].date()} → {reference_index[-1].date()})"
+        f"✅ Final dataset ready | Tokens: {len(final_data)} | Days: {len(common_dates)}"
     )
 
-    # ✅ RETURN MUST BE LAST
     return final_data
 
 
 def validate_data_files(
     data_dir: Path, token_list: List[str], market_index: str
-) -> bool:
-    """Quick validation"""
-    all_tokens = list(set(token_list + [market_index]))
+) -> Tuple[bool, List[str]]:
+    """Validate data files exist"""
     missing_files = []
+    all_tokens = token_list + [market_index]
 
     for token in all_tokens:
         file_path = data_dir / f"{token}.csv"
         if not file_path.exists():
             missing_files.append(token)
-            logger.error(f"❌ {token}: File not found")
 
     if missing_files:
-        logger.error(f"❌ Missing {len(missing_files)} files: {missing_files}")
-        return False
+        logger.error(f"❌ Missing files: {missing_files}")
+        return False, missing_files
 
-    logger.info(f"✅ All {len(all_tokens)} data files validated")
-    return True
+    logger.info(f"✅ All {len(all_tokens)} data files found")
+    return True, []

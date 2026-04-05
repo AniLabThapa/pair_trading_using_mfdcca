@@ -26,152 +26,121 @@ def compute_hurst_exponent_robust(log_scales, log_Fq):
         return torch.tensor(float("nan"), device=DEVICE)
 
 
-def scale_selection(data_length, num_scales=25):
-    """
-    Generate log-spaced scales for MF-DCCA
-
-    Args:
-        data_length (int): Length of the time series
-        num_scales (int): Number of scales to generate
-
-    Returns:
-        torch.Tensor: 1D tensor of scales (int)
-    """
+def scale_selection(data_length, num_scales=12):
     s_min = 10
-    s_max = data_length // 4
+    s_max = data_length // 4  # 62 for N=250
 
     if s_max <= s_min:
         return torch.tensor([], device=DEVICE, dtype=torch.int32)
 
-    # Log-spaced values (float)
-    scales_float = np.logspace(np.log10(s_min), np.log10(s_max), num=num_scales)
+    scales = np.logspace(np.log10(s_min), np.log10(s_max), num=num_scales)
+    scales = np.unique(np.round(scales).astype(int))
 
-    # Round to nearest integer and remove duplicates
-    scales = np.unique(np.round(scales_float).astype(int))
+    if len(scales) < 8:
+        scales = np.unique(
+            np.round(np.logspace(np.log10(s_min), np.log10(s_max), num=12)).astype(int)
+        )
 
     return torch.tensor(scales, device=DEVICE, dtype=torch.int32)
 
 
 def get_design_matrix(scale: int, device: torch.device, dtype=torch.float32):
-    """
-    Cached design matrix for linear detrending
-    Returns: (X^T X)^-1 X^T for fast least squares
-    """
-    key = (scale, str(device), str(dtype))
+    """Quadratic (2nd order) detrending - standard for crypto MFDCCA"""
+    key = (scale, "quadratic", str(device), str(dtype))
+
     if key not in _DESIGN_MATRIX_CACHE:
-        t = torch.arange(scale, dtype=dtype, device=device)
-        X = torch.stack([t, torch.ones_like(t)], dim=1)
+        t = torch.arange(scale, dtype=dtype, device=device).float()
+        X = torch.stack([t**2, t, torch.ones_like(t)], dim=1)  # t² + t + 1
         XtX_inv_Xt = torch.linalg.inv(X.T @ X) @ X.T
         _DESIGN_MATRIX_CACHE[key] = XtX_inv_Xt
     return _DESIGN_MATRIX_CACHE[key]
 
 
 def compute_fluctuation_function(profiles1, profiles2, scale, q, design_matrix):
-    """
-    CORRECTED MF-DCCA implementation matching the algorithm exactly
-    """
+    """Core MFDCCA with quadratic detrending + modulus (matches paper)"""
     n_pairs = profiles1.shape[0]
     N = profiles1.shape[1]
-
-    # 1. Determine number of segments (Ns)
-    Ns = N // scale  # This is int(N/s) as per algorithm
-
-    # 2. Total segments = 2 * Ns (forward + reverse)
+    Ns = N // scale
     total_segments = 2 * Ns
 
-    # 3. Initialize segment arrays
     seg1 = torch.zeros((n_pairs, total_segments, scale), device=DEVICE)
     seg2 = torch.zeros((n_pairs, total_segments, scale), device=DEVICE)
 
-    # 4. Extract FORWARD segments (v = 1, 2, ..., Ns)
+    # Forward
     for ν in range(Ns):
         start_idx = ν * scale
         seg1[:, ν, :] = profiles1[:, start_idx : start_idx + scale]
         seg2[:, ν, :] = profiles2[:, start_idx : start_idx + scale]
 
-    # 5. Extract REVERSE segments (v = Ns+1, ..., 2Ns)
-    #    Starting from the END and going backward
+    # Reverse
     for ν in range(Ns):
-        # Formula from algorithm: X(N - (v - Ns)s + i)
-        # For v = Ns + ν (where ν runs from 0 to Ns-1)
-        # start_idx = N - (ν + 1) * scale  # This is CORRECT
         start_idx = N - (ν + 1) * scale
         seg1[:, Ns + ν, :] = profiles1[:, start_idx : start_idx + scale]
         seg2[:, Ns + ν, :] = profiles2[:, start_idx : start_idx + scale]
 
-    # Flatten for batch processing
     seg1_flat = seg1.reshape(-1, scale)
     seg2_flat = seg2.reshape(-1, scale)
 
-    # 6. Linear detrending (same as before)
+    # Quadratic fit
     coeffs1 = seg1_flat @ design_matrix.T
     coeffs2 = seg2_flat @ design_matrix.T
-
     t = torch.arange(scale, device=DEVICE, dtype=torch.float32)
-    fitted1 = coeffs1[:, 0:1] * t + coeffs1[:, 1:2]
-    fitted2 = coeffs2[:, 0:1] * t + coeffs2[:, 1:2]
+    fitted1 = coeffs1[:, 0:1] * (t**2) + coeffs1[:, 1:2] * t + coeffs1[:, 2:3]
+    fitted2 = coeffs2[:, 0:1] * (t**2) + coeffs2[:, 1:2] * t + coeffs2[:, 2:3]
 
     residuals1 = seg1_flat - fitted1
     residuals2 = seg2_flat - fitted2
 
-    # 7. Compute F²(s, ν) = (1/s) Σ |X-X̃|·|Y-Ỹ|
     F2_segment = (torch.abs(residuals1) * torch.abs(residuals2)).mean(dim=1)
-
     F2_segment = F2_segment.view(n_pairs, total_segments)
 
-    # 8. Compute q-order fluctuation function
     q_val = float(q)
-
-    if abs(q_val) < 1e-10:  # q = 0
-        # F₀(s) = exp{ 1/(4Ns) Σ ln[F²(s,ν)] }
+    if abs(q_val) < 1e-10:  # q ≈ 0
         log_sum = torch.log(F2_segment + 1e-10).sum(dim=1)
-        Fq = torch.exp(log_sum / (4 * Ns))  # 4Ns = 2 * total_segments
-    else:  # q ≠ 0
-        # F_q(s) = { 1/(2Ns) Σ [F²(s,ν)^(q/2)] }^(1/q)
-        power_sum = F2_segment.pow(q_val / 2.0).sum(dim=1)
+        Fq = torch.exp(log_sum / (4 * Ns))
+    else:
+        power_sum = (F2_segment + 1e-10).pow(q_val / 2.0).sum(dim=1)
         Fq = torch.pow((1.0 / (2 * Ns)) * power_sum, 1.0 / q_val)
 
     return Fq
 
 
-import torch
 from scipy.interpolate import UnivariateSpline
+
+
+from scipy.interpolate import UnivariateSpline
+import torch
+import numpy as np
 
 
 def compute_multifractal_spectrum(q_vals, Hq_vals):
     """
-    Correct Legendre transform for MF-DCCA
-    Implements Equations 4-5 from the paper:
-        α = H(q) + q * dH/dq
-        f(α) = q * (α - H(q)) + 1
-
-    Args:
-        q_vals: 1D tensor of q values
-        Hq_vals: 1D tensor of generalized Hurst exponents H(q)
-
-    Returns:
-        dict with keys: 'alpha', 'f_alpha', 'delta_alpha', 'tau_q'
+    Correct Legendre transform for MFDCCA with stable derivative.
+    Uses original H(q) + smoothed derivative of H(q) via cubic spline.
+    This matches best practices in recent MFDCCA literature.
     """
-    import numpy as np
-    import torch
-
-    # Convert to numpy for gradient calculation
     q = q_vals.cpu().numpy()
     Hq = Hq_vals.cpu().numpy()
 
-    # Step 1: Renyi exponent
-    tau_q = q * Hq - 1.0
+    # Sort just in case (UnivariateSpline requires increasing q)
+    sort_idx = np.argsort(q)
+    q_sorted = q[sort_idx]
+    Hq_sorted = Hq[sort_idx]
 
-    # Step 2: derivative of H(q)
-    dH_dq = np.gradient(Hq, q)
+    # Fit cubic spline to original H(q)
+    spline = UnivariateSpline(q_sorted, Hq_sorted, k=3, s=0.1)
 
-    # Step 3: singularity strength α
-    alpha = Hq + q * dH_dq
+    # Use ORIGINAL H(q) for tau, alpha base, and f(alpha)
+    # Only the derivative is taken from the smooth spline
+    Hq_use = Hq
 
-    # Step 4: multifractal spectrum f(α)
-    f_alpha = q * (alpha - Hq) + 1.0
+    dH_dq = spline.derivative()(q)
 
-    # Step 5: multifractality width Δα
+    # Legendre transform (exactly as in the paper Eq. 11-12)
+    tau_q = q * Hq_use - 1.0
+    alpha = Hq_use + q * dH_dq
+    f_alpha = q * (alpha - Hq_use) + 1.0
+
     delta_alpha = np.max(alpha) - np.min(alpha)
 
     # Convert back to tensors
@@ -198,7 +167,6 @@ def compute_delta_metrics(Hq_all, q_values):
     # ΔH metric
     delta_H = valid_Hq.max() - valid_Hq.min()
 
-    # Δα metric via corrected Legendre transform
     try:
         spectrum = compute_multifractal_spectrum(valid_q, valid_Hq)
         delta_alpha = spectrum["delta_alpha"]
@@ -286,15 +254,20 @@ def process_token_pairs(token_list, residuals, q_list):
             Fq_all_scales[:, scale_idx] = Fq
 
         # **STEP 3: Extract H(q) via log-log regression**
-        epsilon = 1e-10
-        log_Fq_vals = torch.log(Fq_all_scales + epsilon)
+        valid_mask = (Fq_all_scales > 0) & torch.isfinite(Fq_all_scales)
+
+        log_Fq_vals = torch.where(
+            valid_mask,
+            torch.log(Fq_all_scales),
+            torch.tensor(float("nan"), device=DEVICE),
+        )
 
         # Fit H(q) for each pair
         for pair_idx in range(n_pairs):
             valid_mask = torch.isfinite(log_Fq_vals[pair_idx])
 
-            # Need at least 4 points for reliable regression
-            if valid_mask.sum() >= 4:
+            # Need at least 2 points for reliable regression
+            if valid_mask.sum() >= 2:
                 try:
                     Hq_val = compute_hurst_exponent_robust(
                         log_scales[valid_mask], log_Fq_vals[pair_idx, valid_mask]
@@ -316,7 +289,7 @@ def process_token_pairs(token_list, residuals, q_list):
 
         # Need at least 3 q-values for spectrum computation
         # (5+ recommended for stable Legendre transform)
-        if valid_mask.sum() >= 3:
+        if valid_mask.sum() >= 2:
             delta_H, delta_alpha = compute_delta_metrics(
                 Hq_pair[valid_mask], q_tensor[valid_mask]
             )

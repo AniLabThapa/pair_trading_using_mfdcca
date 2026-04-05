@@ -1,0 +1,2 @@
+pval_threshold,divergence_lookback,divergence_threshold,Mean_Return,Std_Dev,Downside_Deviation,Sharpe_Ratio,Sortino_Ratio,Max_Drawdown_%,Calmar_Ratio,Profit_Factor,Gross_Profit,Gross_Loss,case_number
+0.01,6.0,0.14,0.03959038309558795,2.149430298906373,1.119484,0.2924,0.5614,56.06,0.0858,1.1197,385.82178325685004,344.56860407124736,59.0

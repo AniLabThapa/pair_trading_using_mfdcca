@@ -1,0 +1,3 @@
+Method,CAPM_filter,Sharpe_ratio,Sortino_ratio,MDD_%,Calmar_ratio,Profit_factor,Gross_profit,Gross_loss
+MFDCCA,X,0.875,1.4267,13.53,1.2577,1.3362,291.811,218.3938
+MFDCCA,O,0.9138,1.6664,23.33,0.7635,1.4147,259.1949,183.2136

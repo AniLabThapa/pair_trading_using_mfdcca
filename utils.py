@@ -1,72 +1,99 @@
 """
-Unified GPU utility functions - replaces scattered duplicates
+utils.py - Utility functions
 """
 
-import torch
-import numpy as np
 import pandas as pd
-from config import DEVICE
+import logging
+import numpy as np
+from pathlib import Path
+from typing import List
+
+logger = logging.getLogger(__name__)
 
 
-def to_gpu_tensor(data, dtype=torch.float32):
+def ensure_dir(path: Path) -> Path:
     """
-    Single source of truth for GPU conversion
-    Replaces: safe_to_gpu, ensure_gpu_tensor (x2)
-    """
-    if isinstance(data, torch.Tensor):
-        return data.to(DEVICE, dtype=dtype)
-    elif isinstance(data, pd.Series):
-        return torch.tensor(data.values, device=DEVICE, dtype=dtype)
-    elif isinstance(data, np.ndarray):
-        return torch.tensor(data, device=DEVICE, dtype=dtype)
-    else:
-        return torch.tensor(data, device=DEVICE, dtype=dtype)
-
-
-import torch
-
-
-def safe_to_gpu(data, device=None, dtype=None):
-    """
-    Safely move data to GPU if available.
+    Create directory if it doesn't exist and return the path.
 
     Args:
-        data: Data to move to GPU (can be torch.Tensor, list, numpy array, etc.)
-        device: Specific device to use. If None, uses default GPU if available.
-        dtype: Data type for tensor conversion (e.g., torch.float32)
+        path: Path object to directory
 
     Returns:
-        Data on GPU (or original data if GPU not available)
+        The same path object (for chaining)
     """
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
-    if torch.cuda.is_available():
-        if isinstance(data, torch.Tensor):
-            tensor_data = data.to(device)
-        else:
-            # Convert to tensor
-            try:
-                tensor_data = torch.tensor(
-                    data, dtype=dtype if dtype else torch.float32
-                ).to(device)
-            except:
-                # If conversion fails, return original data
-                return data
 
-        # Apply dtype if specified
-        if dtype is not None:
-            tensor_data = tensor_data.to(dtype=dtype)
+def generate_trading_weeks(all_dates, start_date, end_date):
+    """
+    Generate canonical week start dates using ISO week calendar.
 
-        return tensor_data
-    else:
-        # On CPU
-        if isinstance(data, torch.Tensor):
-            if dtype is not None:
-                return data.to(dtype=dtype)
-            return data
-        else:
-            try:
-                return torch.tensor(data, dtype=dtype if dtype else torch.float32)
-            except:
-                return data
+    Algorithm:
+    1. Find all ISO weeks that have trading days in [start_date, end_date]
+    2. For each ISO week, get its Monday
+    3. Find the first trading day on or after that Monday (from FULL dataset)
+    4. Only include if that trading day falls within [start_date, end_date]
+
+    This ensures deterministic results regardless of how dates are filtered.
+
+    Args:
+        all_dates: DatetimeIndex of ALL available trading days (including lookback)
+        start_date: Evaluation period start
+        end_date: Evaluation period end
+
+    Returns:
+        Sorted list of pd.Timestamp representing week starts
+    """
+    all_dates = pd.DatetimeIndex(all_dates).sort_values().unique()
+
+    # Get dates within evaluation period
+    eval_dates = all_dates[(all_dates >= start_date) & (all_dates <= end_date)]
+
+    if len(eval_dates) == 0:
+        logger.warning(
+            f"No trading dates in range {start_date.date()} to {end_date.date()}"
+        )
+        return []
+
+    weeks = []
+    seen_weeks = set()
+
+    for date in eval_dates:
+        # Get ISO week identifier
+        iso_year, iso_week, _ = date.isocalendar()
+        week_key = (iso_year, iso_week)
+
+        if week_key in seen_weeks:
+            continue
+        seen_weeks.add(week_key)
+
+        # Calculate Monday of this ISO week
+        try:
+            monday = pd.Timestamp.fromisocalendar(iso_year, iso_week, 1)
+        except Exception as e:
+            logger.warning(
+                f"Could not calculate Monday for {iso_year}-W{iso_week}: {e}"
+            )
+            continue
+
+        # ⭐ KEY FIX: Find first trading day >= Monday from FULL dataset
+        candidates = all_dates[all_dates >= monday]
+
+        if len(candidates) == 0:
+            continue
+
+        week_start = candidates[0]
+
+        # Only include if week_start is within evaluation period
+        if start_date <= week_start <= end_date:
+            weeks.append(week_start)
+
+    weeks = sorted(weeks)
+
+    logger.info(
+        f"Generated {len(weeks)} trading weeks: "
+        f"{weeks[0].date() if weeks else 'N/A'} to {weeks[-1].date() if weeks else 'N/A'}"
+    )
+
+    return weeks

@@ -1,14 +1,19 @@
+"""
+ Precompute Module -
+===========================================
+"""
+
 import logging
-from pathlib import Path
-from typing import Dict, List, Tuple, Any, Optional, Union
 import pandas as pd
 import torch
-from pandas.tseries.offsets import BDay  # <-- ADD THIS IMPORT
+from pathlib import Path
+import numpy as np
+from typing import Dict, Any, List, Tuple, Optional, Union
+
 from config import CONFIG, DEVICE
 from data_processing import load_all_token_data_cached
 from capm import apply_capm_filter
-from simulation import get_lookback_and_cutoff
-
+from utils import generate_trading_weeks
 from feature_extraction import (
     extract_mfdcca_features,
     extract_dcca_features,
@@ -16,284 +21,296 @@ from feature_extraction import (
     extract_cointegration_features,
 )
 
-from simulation import generate_trading_weeks
-
 logger = logging.getLogger(__name__)
 
+# Type alias for feature dictionaries
+FeatureDict = Union[Dict[str, Any], Dict[Tuple[str, str], Dict[str, Any]]]
 
-def create_cache_data(
-    method,
-    residuals,
-    price_data_lookback,
-    aligned_capm_results,
-    current_date,
-    lookback_start,
-    lookback_end,
-    information_cutoff,
-    method_specific_data,
-):
-    """Create cache data structure with GPU tensors"""
-    base_cache = {
+
+# ============================================================================
+# CORE CACHE FUNCTIONS (Minimal & Essential)
+# ============================================================================
+def _get_cache_path(method: str, week_start: pd.Timestamp) -> Path:
+    """Cache path using only the week start date"""
+    cache_dir = Path(CONFIG["results_dir"]) / "precompute_v2" / method
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # Use ISO format date: 2021-01-04
+    return cache_dir / f"{week_start.strftime('%Y-%m-%d')}.pt"
+
+
+def save_features_to_cache(
+    method: str,
+    week_start: pd.Timestamp,
+    features: FeatureDict,
+    token_list: List[str],
+    lookback_start: pd.Timestamp,
+    lookback_end: pd.Timestamp,
+    capm_results: Optional[Dict] = None,
+) -> None:
+    """Save features with metadata to cache."""
+    cache_file = _get_cache_path(method, week_start)
+
+    cache_data = {
+        "features": features,
         "method": method,
-        "residuals": residuals,
-        "price_data_lookback": price_data_lookback,
-        "week_start": current_date,
+        "week_start": week_start,
+        "token_list": token_list,
         "lookback_start": lookback_start,
         "lookback_end": lookback_end,
-        "information_cutoff": information_cutoff,
-        "skipped": False,
-        "cache_version": "5.0_gpu",
-        "window_size": CONFIG["window"],
-        "cached_date": pd.Timestamp.now(),
-        "device": str(DEVICE),
+        "capm_results": capm_results,
     }
 
-    if aligned_capm_results and len(aligned_capm_results) > 0:
-        sample_token = next(iter(aligned_capm_results.keys()))
-        base_cache["actual_days"] = aligned_capm_results[sample_token].get(
-            "actual_days", 0
+    torch.save(cache_data, cache_file)
+    logger.debug(f"Cached {week_start.date()}: {cache_file.name}")
+
+
+def load_features_from_cache(week_start, method, cache_dir=None):
+    """Load precomputed features from cache."""
+    if cache_dir is None:
+        cache_dir = Path(CONFIG["results_dir"]) / "precompute_v2" / method
+
+    if isinstance(week_start, pd.Timestamp):
+        week_str = week_start.strftime("%Y-%m-%d")
+    else:
+        week_str = str(week_start)
+
+    cache_file = cache_dir / f"{week_str}.pt"
+
+    if not cache_file.exists():
+        raise FileNotFoundError(
+            f"Precomputed features not found for week {week_str}. "
+            "Run precompute_features_for_all_weeks first."
         )
 
-    if method_specific_data:
-        base_cache.update(method_specific_data)
+    cache_data = torch.load(cache_file, weights_only=False)
 
-    return base_cache
+    if cache_data["method"] != method:
+        raise ValueError(
+            f"Cached method mismatch: expected {method}, "
+            f"found {cache_data['method']}"
+        )
+
+    # ✅ RETURN FULL CACHE DATA, NOT JUST FEATURES
+    return cache_data  # NOT cache_data["features"]
 
 
-def precompute_training_features(
-    fold_number: int, method: str, period_start: pd.Timestamp, period_end: pd.Timestamp
-):
+# ============================================================================
+# UNIFIED PRECOMPUTE FUNCTION (NEW - ADD THIS)
+# ============================================================================
+
+
+def precompute_all_methods(
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+    methods: Optional[List[str]] = None,
+) -> Dict[str, int]:
     """
-    Pre-compute features for all weeks in the training period.
-
-    This function runs ONCE per method per fold to generate cached features
-    that will be reused across all Optuna trials.
-
-    Args:
-        fold_number: Fold index (1-based)
-        method: Trading method (mfdcca, dcca, pearson, cointegration, index)
-        period_start: Training period start date
-        period_end: Training period end date
+    ✨ OPTIMIZED: Compute ALL methods in ONE pass
     """
-    logger.info(f"🔧 PRE-COMPUTE: Starting for fold {fold_number}, method {method}")
-    logger.info(f"   Period: {period_start.date()} to {period_end.date()}")
+    if methods is None:
+        methods = ["mfdcca", "dcca", "pearson", "cointegration"]
 
-    cache_dir = (
-        Path(CONFIG["results_dir"]) / "precompute" / f"fold_{fold_number}" / method
-    )
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"\n{'='*70}")
+    logger.info(f"UNIFIED PRECOMPUTE: {', '.join(m.upper() for m in methods)}")
+    logger.info(f"{'='*70}")
 
-    target_lookback = CONFIG["window"]
-    holding_period_days = CONFIG["holding_period_days"]
-
-    # Generate weekly periods
-    weekly_periods = generate_trading_weeks(
-        period_start, period_end, holding_period_days
+    # ✅ FIX: Use fixed data range from CONFIG
+    all_data = load_all_token_data_cached(
+        start_date=CONFIG["data_loading_start"],
+        end_date=CONFIG["data_loading_end"],
+        market_index=CONFIG["market_index"],
     )
 
-    if not weekly_periods:
-        logger.error("No weekly periods generated!")
-        return
+    if not all_data:
+        logger.error("No data loaded!")
+        return {m: 0 for m in methods}
 
-    logger.info(f"   Weeks to precompute: {len(weekly_periods)}")
+    # Get trading dates
+    market_dates = all_data[CONFIG["market_index"]].index
+    all_dates = pd.DatetimeIndex(market_dates)
 
-    # Process each week
-    for week_number, (current_date, week_end) in enumerate(weekly_periods, 1):
-        cache_file = cache_dir / f"week_{week_number}_{current_date.date()}.pt"
+    # Generate weeks - filter using start_date and end_date parameters
+    weekly_starts = generate_trading_weeks(all_dates, start_date, end_date)
+    logger.info(f"📅 Processing {len(weekly_starts)} weeks for {len(methods)} methods")
+    logger.info(f"📊 Total tasks: {len(weekly_starts) * len(methods)}\n")
 
-        if cache_file.exists():
-            logger.info(f"✅ Week {week_number}: Cache exists, skipping")
-            continue
+    successful_counts = {method: 0 for method in methods}
 
-        logger.info(
-            f"⚙️  Week {week_number}/{len(weekly_periods)}: {current_date.date()}"
-        )
+    # ═══════════════════════════════════════════════════════════
+    # STEP 2: Loop weeks ONCE
+    # ═══════════════════════════════════════════════════════════
+    for week_num, week_start in enumerate(weekly_starts, 1):
+        try:  # ← 8 spaces, not 12
+            # Extract lookback window
+            prev_dates = all_dates[all_dates < week_start]
+            if len(prev_dates) < 200:
+                continue
 
-        lookback_start, lookback_end, information_cutoff = get_lookback_and_cutoff(
-            current_date, target_lookback
-        )
+            lookback_start = prev_dates[-250]
+            lookback_end = prev_dates[-1]
 
-        logger.debug(
-            f"   Lookback: {lookback_start.date()} → {lookback_end.date()} "
-            f"(cutoff: {information_cutoff.date()})"
-        )
-
-        # Load price data
-        price_data_lookback = load_all_token_data_cached(
-            lookback_start,
-            lookback_end,
-            CONFIG["market_index"],
-        )
-
-        if not price_data_lookback:
-            logger.warning(f"   Week {week_number}: No data available")
-            torch.save({"skipped": True}, cache_file)
-            continue
-
-        # Initialize storage
-        residuals = {}
-        aligned_capm_results = {}
-        method_specific_data = {}
-
-        # ========================================================================
-        # FEATURE EXTRACTION BY METHOD
-        # ========================================================================
-
-        if method == "index":
-            # INDEX method needs no computation
-            method_specific_data = {"has_index_data": True}
-            logger.info(f"   Week {week_number}: INDEX method (no features)")
-
-        elif method == "cointegration":
-            # Cointegration uses PRICE DATA directly (NO CAPM)
-            logger.info(f"   Week {week_number}: Extracting cointegration features...")
-
-            sample_token = next(iter(price_data_lookback.keys()))
-            actual_days = len(price_data_lookback[sample_token])
-
-            features = extract_cointegration_features(
-                price_data=price_data_lookback,
-                token_list=CONFIG["token_names"],
-                lookback_start=lookback_start,
-                lookback_end=lookback_end,
-            )
-
-            method_specific_data = {
-                "has_cointegration_data": len(features) > 0,
-                "cointegration_features": features,
-                "actual_days": actual_days,
-            }
-
-            # No residuals for cointegration
-            residuals = {}
-            aligned_capm_results = {}
-
-            logger.info(f"   ✅ {len(features)} cointegrated pairs cached")
-
-        else:
-            # Methods using CAPM residuals: mfdcca, dcca, pearson
-            logger.info(f"   Week {week_number}: Running CAPM filtering...")
+            lookback_data = {}
+            for token, df in all_data.items():
+                mask = (df.index >= lookback_start) & (df.index <= lookback_end)
+                window_data = df[mask]
+                if len(window_data) >= 200:
+                    lookback_data[token] = window_data.copy()
 
             capm_results = apply_capm_filter(
-                tokens=CONFIG["token_names"],
+                tokens=list(lookback_data.keys()),
                 market_index=CONFIG["market_index"],
-                price_data=price_data_lookback,
+                price_data=lookback_data,
             )
 
             if not capm_results:
-                logger.warning(f"   Week {week_number}: CAPM failed")
-                torch.save({"skipped": True}, cache_file)
+                logger.debug(f"Week {week_num} ({week_start.date()}): CAPM failed")
                 continue
 
-            # Extract residuals
-            sample_token = next(iter(capm_results.keys()))
-            actual_days = capm_results[sample_token]["common_days_used"]
+            residuals = {
+                t: capm_results[t]["residuals"]
+                for t in capm_results
+                if "residuals" in capm_results[t]
+            }
 
-            for token in capm_results:
-                if "residuals" in capm_results[token]:
-                    residuals[token] = capm_results[token]["residuals"]
-                    aligned_capm_results[token] = {
-                        "residuals": residuals[token],
-                        "beta": capm_results[token]["beta"],
-                        "alpha": capm_results[token]["alpha"],
-                        "actual_days": actual_days,
-                    }
-
-            if not residuals:
-                logger.warning(f"   Week {week_number}: No valid residuals")
-                torch.save({"skipped": True}, cache_file)
-                continue
-
-            logger.debug(f"   CAPM: {len(residuals)} tokens, {actual_days} days")
-
-            # Extract method-specific features
-            if method == "mfdcca":
-                logger.info(f"   Week {week_number}: Extracting MFDCCA features...")
-
-                features = extract_mfdcca_features(
-                    residuals=residuals,
-                    token_list=CONFIG["token_names"],
-                    q_list=CONFIG["q_list"],
-                    lookback_start=lookback_start,
-                    lookback_end=lookback_end,
-                )
-
-                if features.get("has_data", False):
-
-                    method_specific_data = {
-                        "has_mfdcca_data": True,
-                        "hurst_dict": features.get("hurst_dict"),
-                        "hxy_matrix": features.get("hxy_matrix"),
-                        "delta_H_matrix": features.get("delta_H_matrix"),
-                        "delta_alpha_matrix": features.get("delta_alpha_matrix"),
-                        "q_list": features.get("q_list"),
-                    }
-                    logger.info(
-                        f"   ✅ MFDCCA cached: {features['hxy_matrix'].shape[0]} tokens"
+            for method in methods:
+                try:
+                    result = _compute_features(
+                        method=method,
+                        residuals=residuals,
+                        price_data=lookback_data,
+                        lookback_start=lookback_start,
+                        lookback_end=lookback_end,
                     )
-                else:
-                    method_specific_data = {"has_mfdcca_data": False}
-                    logger.warning(f"   Week {week_number}: MFDCCA extraction failed")
 
-            elif method == "dcca":
-                logger.info(f"   Week {week_number}: Extracting DCCA features...")
+                    if result is None:
+                        continue
+                    features = result[0]
+                    token_list_used = result[1]
 
-                features = extract_dcca_features(
-                    residuals=residuals,
-                    token_list=CONFIG["token_names"],
-                    window=actual_days,
-                )
+                    if features is not None and len(token_list_used) >= 2:
+                        save_features_to_cache(
+                            method=method,
+                            week_start=week_start,
+                            features=features,
+                            token_list=token_list_used,
+                            lookback_start=lookback_start,
+                            lookback_end=lookback_end,
+                            capm_results=(
+                                capm_results if method != "mfdcca_raw" else None
+                            ),
+                        )
+                        successful_counts[method] += 1
 
-                method_specific_data = {
-                    "has_dcca_data": len(features) > 0,
-                    "dcca_features": features,
-                }
-                logger.info(f"   ✅ DCCA cached: {len(features)} pairs")
-
-            elif method == "pearson":
-                logger.info(f"   Week {week_number}: Extracting Pearson features...")
-
-                features = extract_pearson_features(
-                    residuals=residuals,
-                    token_list=CONFIG["token_names"],
-                    window=actual_days,
-                )
-
-                if features.get("has_data", False):
-                    method_specific_data = {
-                        "has_pearson_data": True,
-                        "correlation_matrix": features["correlation_matrix"],
-                        "token_list": features["token_list"],
-                    }
-                    logger.info(
-                        f"   ✅ Pearson cached: {features['correlation_matrix'].shape[0]} tokens"
+                except Exception as e:
+                    logger.debug(
+                        f"Week {week_num} ({week_start.date()}) {method} failed: {e}"
                     )
-                else:
-                    method_specific_data = {"has_pearson_data": False}
-                    logger.warning(f"   Week {week_number}: Pearson extraction failed")
+                    continue
 
-        # ========================================================================
-        # SAVE CACHE
-        # ========================================================================
-        cache_data = create_cache_data(
-            method,
-            residuals,
-            price_data_lookback,
-            aligned_capm_results,
-            current_date,
-            lookback_start,
-            lookback_end,
-            information_cutoff,
-            method_specific_data,
+        except Exception as e:  # ← 8 spaces, matches try
+            logger.debug(f"Week {week_num} ({week_start.date()}) failed: {e}")
+            continue
+
+    # ═══════════════════════════════════════════════════════════
+    # STEP 3: Report results
+    # ═══════════════════════════════════════════════════════════
+    logger.info(f"\n{'='*70}")
+    logger.info(f"UNIFIED PRECOMPUTE COMPLETE")
+    logger.info(f"{'='*70}")
+    for method in methods:
+        success_rate = (
+            (successful_counts[method] / len(weekly_starts)) * 100
+            if weekly_starts
+            else 0
         )
+        logger.info(
+            f"  {method.upper()}: {successful_counts[method]}/{len(weekly_starts)} "
+            f"weeks ({success_rate:.1f}%)"
+        )
+    logger.info(f"{'='*70}\n")
 
-        try:
-            torch.save(cache_data, cache_file)
-            logger.debug(f"   💾 Cache saved: {cache_file.name}")
-        except Exception as e:
-            logger.error(f"   ❌ Failed to save cache: {e}")
+    return successful_counts
 
-    logger.info(
-        f"✅ PRE-COMPUTE COMPLETE: fold {fold_number}, method {method} "
-        f"({len(weekly_periods)} weeks cached)"
-    )
+
+# Add this type alias near the top of precompute.py with the other type aliases
+ComputeResult = Tuple[FeatureDict, List[str]]
+
+
+def _compute_features(
+    method: str,
+    residuals: Dict[str, pd.Series],
+    price_data: Dict[str, pd.DataFrame],
+    lookback_start: pd.Timestamp,
+    lookback_end: pd.Timestamp,
+) -> Optional[ComputeResult]:
+    """
+    Returns (features, token_list_used) tuple.
+    token_list_used is the list of tokens the features were computed from —
+    for mfdcca it is residuals.keys(), for mfdcca_raw it is raw_returns.keys().
+    """
+    if method == "mfdcca":
+        token_list = list(residuals.keys())
+        features = extract_mfdcca_features(
+            residuals=residuals,
+            token_list=token_list,
+            q_list=CONFIG["q_list"],
+            lookback_start=lookback_start,
+            lookback_end=lookback_end,
+        )
+        return features, token_list
+
+    elif method == "mfdcca_raw":
+        raw_returns: Dict[str, pd.Series] = {}
+        for token, df in price_data.items():
+            if token == CONFIG["market_index"]:
+                continue
+            closes = pd.Series(df["close"].values, index=df.index).dropna()
+            if len(closes) > 1:
+                log_ret = (closes / closes.shift(1)).apply(np.log).dropna()
+                if len(log_ret) >= 50:
+                    raw_returns[token] = log_ret
+        if len(raw_returns) < 2:
+            return None
+        token_list = list(raw_returns.keys())
+        features = extract_mfdcca_features(
+            residuals=raw_returns,
+            token_list=token_list,
+            q_list=CONFIG["q_list"],
+            lookback_start=lookback_start,
+            lookback_end=lookback_end,
+        )
+        return features, token_list
+
+    elif method == "dcca":
+        token_list = list(residuals.keys())
+        features = extract_dcca_features(
+            residuals=residuals,
+            token_list=token_list,
+            lookback_start=lookback_start,
+            lookback_end=lookback_end,
+        )
+        return features, token_list
+
+    elif method == "pearson":
+        token_list = list(residuals.keys())
+        features = extract_pearson_features(
+            residuals=residuals,
+            token_list=token_list,
+            lookback_start=lookback_start,
+            lookback_end=lookback_end,
+        )
+        return features, token_list
+
+    elif method == "cointegration":
+        coint_tokens = [t for t in price_data if t != CONFIG["market_index"]]
+        coint_price_data = {t: price_data[t] for t in coint_tokens}
+        features = extract_cointegration_features(
+            price_data=coint_price_data,
+            token_list=coint_tokens,
+            lookback_start=lookback_start,
+            lookback_end=lookback_end,
+        )
+        return features, coint_tokens
+
+    return None
