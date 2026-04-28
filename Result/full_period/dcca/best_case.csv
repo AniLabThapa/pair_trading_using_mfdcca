@@ -1,2 +1,2 @@
 pair_hxy_threshold,divergence_lookback,divergence_threshold,Mean_Return,Std_Dev,Downside_Deviation,Sharpe_Ratio,Sortino_Ratio,Max_Drawdown_%,Calmar_Ratio,Profit_Factor,Gross_Profit,Gross_Loss,case_number
-0.5,3.0,0.13,0.18725560646528963,6.14164747466812,1.003527,0.484,2.9621,39.75,0.6735,1.6937,476.39965280879426,281.2793108719625,373.0
+0.5,3.0,0.13,47.18841282925299,97.49563114919826,15.930493,0.484,2.9621,39.75,0.6735,1.6937,476.39965280879426,281.2793108719625,373.0

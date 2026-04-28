@@ -240,9 +240,13 @@ def calculate_performance_metrics(
     rf_daily = (1 + risk_free_rate_annual) ** (1 / trading_days_per_year) - 1.0
     excess = returns - rf_daily
 
-    # 3. PERFORMANCE MATH
+    # DAILY statistics
     mean_daily = np.mean(returns)
     std_daily = np.std(returns, ddof=1)
+
+    # ANNUALIZE (professor requirement)
+    mean_annual = mean_daily * trading_days_per_year
+    std_annual = std_daily * np.sqrt(trading_days_per_year)
 
     # Sharpe with Stability Check
     std_excess = np.std(excess, ddof=1)
@@ -317,9 +321,11 @@ def calculate_performance_metrics(
     ensure_dir(result_dir)
 
     return {
-        "Mean_Return": mean_daily * 100,
-        "Std_Dev": std_daily * 100,
-        "Downside_Deviation": round(downside_deviation * 100, 6),
+        "Mean_Return": mean_annual * 100,
+        "Std_Dev": std_annual * 100,
+        "Downside_Deviation": round(
+            downside_deviation * np.sqrt(trading_days_per_year) * 100, 6
+        ),
         "Sharpe_Ratio": round(sharpe, 4),
         "Sortino_Ratio": round(sortino, 4),
         "Max_Drawdown_%": round(max_dd * 100, 2),

@@ -538,7 +538,6 @@ def main():
         final_results[method] = result
         metrics, _ = extract_metrics(result)
 
-        # ✅ Overwrite best_cases with metrics (safe — snapshot already captured params)
         best_cases[method] = metrics
 
         # ✅ Pass params from snapshot (not best_cases[method] which is now metrics)
@@ -553,7 +552,6 @@ def main():
     logger.info("PHASE 4.5: Sub-Period Yearly Evaluation")
     logger.info("=" * 70)
 
-    # ✅ BUG #2 FIX: Pass best_params_snapshot["mfdcca"] directly.
     all_period_results = evaluate_sub_periods(
         best_mfdcca_params=best_params_snapshot["mfdcca"],
         use_cache=use_cache,
