@@ -2,8 +2,7 @@ import logging
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import List, Dict, Any, Union, Tuple, Set, Optional
-from config import CONFIG
+from typing import List, Dict, Any, Union, Tuple, Set
 
 logger = logging.getLogger(__name__)
 
@@ -46,11 +45,6 @@ def apply_divergence_filter(
         # Extract last effective_lookback prices
         prices1 = df1["close"].iloc[-effective_lookback:].values
         prices2 = df2["close"].iloc[-effective_lookback:].values
-
-        # Calculate cumulative returns
-        # Extract last effective_lookback prices as float arrays
-        prices1 = df1["close"].iloc[-effective_lookback:].to_numpy(dtype=float)
-        prices2 = df2["close"].iloc[-effective_lookback:].to_numpy(dtype=float)
 
         # Calculate cumulative returns
         cum_ret1 = prices1[-1] / prices1[0] - 1.0
@@ -196,9 +190,6 @@ def create_empty_metrics() -> Dict[str, Any]:
         "Max_Drawdown_%": 0.0,
         "Calmar_Ratio": 0.0,
         "Profit_Factor": 0.0,
-        "Win_Rate_%": 0.0,
-        "Avg_Gain_to_Loss_Ratio": 0.0,
-        "Annualized_Turnover_%": 0.0,
         "Gross_Profit": 0.0,
         "Gross_Loss": 0.0,
         "Daily_Return_Series": pd.Series(dtype=float),
@@ -210,7 +201,7 @@ def calculate_performance_metrics(
     result_dir: Path,
     period_name: str,
     trading_days_per_year: float = 252.0,
-    risk_free_rate_annual: Optional[float] = None,
+    risk_free_rate_annual: float = 0.0,
 ) -> Dict[str, Any]:
     """
     Calculate performance metrics for trading strategies or benchmarks.
@@ -220,15 +211,11 @@ def calculate_performance_metrics(
         result_dir: Directory to save results
         period_name: Name of evaluation period (used to detect benchmarks)
         trading_days_per_year: Trading days per year (default 252)
-        risk_free_rate_annual: Annual risk-free rate (defaults to CONFIG["risk_free_rate"] if None)
+        risk_free_rate_annual: Annual risk-free rate (default 0.0)
 
     Returns:
         Dictionary of performance metrics
     """
-    if risk_free_rate_annual is None:
-        risk_free_rate_annual = float(CONFIG["risk_free_rate"])
-    else:
-        risk_free_rate_annual = float(risk_free_rate_annual)
 
     # 1. CONCATENATE DATA
     daily_series = [
@@ -250,18 +237,18 @@ def calculate_performance_metrics(
         return create_empty_metrics()
 
     # 2. RISK FREE ADJUSTMENT
-    rf_daily = (1 + risk_free_rate_annual) ** (1 / trading_days_per_year) - 1
+    rf_daily = (1 + risk_free_rate_annual) ** (1 / trading_days_per_year) - 1.0
     excess = returns - rf_daily
 
     # DAILY statistics
     mean_daily = np.mean(returns)
     std_daily = np.std(returns, ddof=1)
 
-    # ANNUALIZE
+    # ANNUALIZE (professor requirement)
     mean_annual = mean_daily * trading_days_per_year
     std_annual = std_daily * np.sqrt(trading_days_per_year)
 
-    # Sharpe Ratio
+    # Sharpe with Stability Check
     std_excess = np.std(excess, ddof=1)
     sharpe = (
         (np.mean(excess) / std_excess * np.sqrt(trading_days_per_year))
@@ -293,28 +280,6 @@ def calculate_performance_metrics(
     gross_profit = np.sum(returns[returns > 0])
     gross_loss = abs(np.sum(returns[returns < 0]))
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0.0
-
-    # ==========================================================
-    # TRADING-DAY WIN RATE
-    # Only count days where the portfolio generated a non-zero return.
-    # ==========================================================
-
-    positive_days = np.sum(returns > 0)
-    negative_days = np.sum(returns < 0)
-
-    active_days = positive_days + negative_days
-
-    win_rate = positive_days / active_days * 100 if active_days > 0 else 0.0
-
-    # ✅ NEW: AVERAGE GAIN-TO-LOSS RATIO
-    # (typical win size vs typical loss size — different from Profit_Factor,
-    #  which compares SUM of wins to SUM of losses, not their AVERAGES)
-
-    winning_returns = returns[returns > 0]
-    losing_returns = returns[returns < 0]
-    avg_gain = np.mean(winning_returns) if winning_returns.size > 0 else 0.0
-    avg_loss = abs(np.mean(losing_returns)) if losing_returns.size > 0 else 0.0
-    avg_gain_to_loss_ratio = avg_gain / avg_loss if avg_loss > 1e-12 else 0.0
 
     # 6. TURNOVER CALCULATION - DISTINGUISH BENCHMARKS FROM PAIR TRADING
     if period_name in ["btc_benchmark", "index_benchmark"]:
@@ -366,9 +331,6 @@ def calculate_performance_metrics(
         "Max_Drawdown_%": round(max_dd * 100, 2),
         "Calmar_Ratio": round(calmar, 4),
         "Profit_Factor": round(profit_factor, 4),
-        "Win_Rate_%": round(win_rate, 4),
-        "Avg_Gain_to_Loss_Ratio": round(avg_gain_to_loss_ratio, 4),  # ← NEW
-        "Annualized_Turnover_%": round(annualized_turnover * 100, 4),
         "Gross_Profit": gross_profit * 100,
         "Gross_Loss": gross_loss * 100,
         "Daily_Return_Series": returns_series,
